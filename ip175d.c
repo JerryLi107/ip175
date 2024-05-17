@@ -45,6 +45,23 @@ MODULE_LICENSE("GPL");
 #define DOUBLE_EQUAL_PORT_TAG_FLAG 3
 #define RTK_TOTAL_NUM_OF_WORD_FOR_1BIT_PORT_LIST 1
 
+//#define IP175D_VLAN_PROC_DEBUG
+#define IP175D_VLAN_ADDR_22 22
+#define IP175D_VLAN_ADDR_23 23
+#define IP175D_PORT_NUM 6
+#define IP175D_ENTRYS_NUM 16
+#define IP175D_PORT_VID_REG_START 4
+#define IP175D_VALN_ENTRY0_START_REG 14
+#define IP175D_VLAN_ENTRYS_ONOFF_REG 10
+#define IP175D_VLAN_ENTRYS_PRI_ONOFF_REG 13
+#define IP175D_VLAN_ENTRYS_PRI_VAL_START_REG 24
+#define IP175D_VALN_ENTRY0_MBR_START_REG 0
+#define IP175D_VALN_ENTRY0_ADDTAG_START_REG 8
+#define IP175D_VALN_ENTRY0_RMTAG_START_REG 16
+#define IP175D_CPU_WAN_PORT 0x21
+#define IP175D_WAN_LAN_PORT 0x03
+#define IP175D_CPU_WAN_LAN_PORT 0x23
+
 //#define DEBUG_INFO
 #if defined(DEBUG_INFO)
 #define DBG_INFO(fmt,arg...)          printk(" "fmt"\n",##arg)
@@ -70,15 +87,337 @@ static struct switch_port_info g_switch_wan_info = {0};
 static struct proc_dir_entry *g_switch_dir = NULL;
 static struct proc_dir_entry *g_switch_lan_dir = NULL;
 static struct proc_dir_entry *g_switch_wan_dir = NULL;
+#ifdef IP175D_VLAN_PROC_DEBUG
+static struct proc_dir_entry *g_switch_vlan_dir = NULL;
+static struct net_device *g_net_dev  = NULL;
+#endif
 
-int ip175_init_vlan(struct net_device *dev, struct ethtool_vlan_port *port)
+static void vlan_set_shift_val(unsigned int is_high_bit, struct mii_bus *bus, int addr, u32 regnum, unsigned int new_val){
+    unsigned int reg_val = 0;
+
+    reg_val = mdiobus_read(bus, addr, regnum);
+    DBG_INFO("addr:%d, reg num:%d original reg_val: 0x%02x \n",addr, regnum, reg_val);
+
+    if(is_high_bit){
+        //高八位, 将mbrmask 放到reg的高8位上
+        reg_val &= 0x00FF;//将高8位置为0000 0000
+        reg_val |= ((new_val<< 8) & 0xFF00);//将低8位置为0000 0000
+    }else{
+        //低八位，将mbrmask 放到reg的低8位上
+        reg_val &= 0xFF00;//将低8位置为0000 0000
+        reg_val |= (new_val & 0x00FF);//将高8位置为0000 0000
+    }
+
+    DBG_INFO("addr:%d, reg num:%d new reg_val: 0x%02x \n",addr, regnum, reg_val);
+    mdiobus_write(bus, addr, regnum, reg_val);
+}
+
+static int vlan_get_shift_val(unsigned int is_high_bit, struct mii_bus *bus, int addr, u32 regnum){
+    unsigned int reg_val = 0;
+
+    reg_val = mdiobus_read(bus, addr, regnum);
+    DBG_INFO("original reg_val: 0x%02x addr:%d, reg num:%d\n",reg_val, addr, regnum);
+
+    if(is_high_bit){
+        reg_val = (reg_val & 0xFF00) >> 8;
+    }else{
+        reg_val &= 0x00FF;
+    }
+    DBG_INFO("is high bit:%d, new reg_val: 0x%02x addr:%d, reg num:%d\n",is_high_bit, reg_val, addr, regnum);
+
+    return reg_val;
+}
+
+static int ip175d_vlan_entry_set(struct net_device *dev, unsigned int vlan_entry_index, unsigned int v_id, unsigned int mbr_mask, unsigned int remove_tag_mask, unsigned int add_tag_mask)
 {
+    unsigned int vlan_entry_vid_reg = 0, vlan_entry_mbr_reg = 0;
+    unsigned int vlan_entry_add_tag_reg = 0, vlan_entry_remove_tag_reg = 0;
+
+    /* set cur vlan entry vid */
+    vlan_entry_vid_reg = IP175D_VALN_ENTRY0_START_REG + vlan_entry_index;
+    DBG_INFO("vlan_entry_reg: %d v_id:%d mbr_mask:%02x\n",vlan_entry_vid_reg, v_id, mbr_mask);
+    mdiobus_write(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, vlan_entry_vid_reg, v_id);
+
+    /* set cur vlan entry members */
+    vlan_entry_mbr_reg = IP175D_VALN_ENTRY0_MBR_START_REG + vlan_entry_index/2;
+    vlan_set_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, vlan_entry_mbr_reg, mbr_mask);
+
+    /* set cur vlan entry add tag*/
+    vlan_entry_add_tag_reg = IP175D_VALN_ENTRY0_ADDTAG_START_REG + vlan_entry_index/2;
+    vlan_set_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, vlan_entry_add_tag_reg, add_tag_mask);
+
+    /* set cur vlan entry remove tag*/
+    vlan_entry_remove_tag_reg = IP175D_VALN_ENTRY0_RMTAG_START_REG + vlan_entry_index/2;
+    vlan_set_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, vlan_entry_remove_tag_reg, remove_tag_mask);
+
+    return RET_OK;
+}
+
+static int ip175d_vlan_entry_get(struct net_device *dev, unsigned int vlan_entry_index){
+    unsigned int reg_val = 0;
+    unsigned int vlan_entry_mbr_reg = 0, vlan_entry_add_tag_reg = 0, vlan_entry_remove_tag_reg = 0;;
+
+    /* set cur vlan entry members */
+    vlan_entry_mbr_reg = IP175D_VALN_ENTRY0_MBR_START_REG + vlan_entry_index/2;
+    reg_val = vlan_get_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, vlan_entry_mbr_reg);
+    printk("%s:mbr mask:0x%02x!\n", __func__, reg_val);
+
+    /* set cur vlan entry add tag*/
+    vlan_entry_add_tag_reg = IP175D_VALN_ENTRY0_ADDTAG_START_REG + vlan_entry_index/2;
+    reg_val = vlan_get_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, vlan_entry_add_tag_reg);
+    printk("%s:add tag port:0x%02x!\n", __func__, reg_val);
+
+    /* set cur vlan entry remove tag*/
+    vlan_entry_remove_tag_reg = IP175D_VALN_ENTRY0_RMTAG_START_REG + vlan_entry_index/2;
+    reg_val = vlan_get_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, vlan_entry_remove_tag_reg);
+    printk("%s:remove tag port:0x%02x!\n", __func__, reg_val);
+
+    return RET_OK;
+}
+
+static unsigned int ip175d_search_vlan_entry(struct net_device *dev, unsigned int vid){
+    unsigned int index =0, reg_num = 0 ,reg_val = 0;
+    for(index = 0; index < IP175D_ENTRYS_NUM; index++){
+        reg_num = IP175D_VALN_ENTRY0_START_REG + index;
+        reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, reg_num);
+        if(reg_val == vid || reg_val == 0){
+            break;
+        }
+    }
+    return index;
+}
+
+static int ip175d_vlan_set(struct net_device *dev, unsigned int vid, unsigned int  mbr_mask,unsigned int  untag_mask){
+    unsigned int vlan_entry_index = 0, reg_val = 0, remove_tag_mask = 0, add_tag_mask = 0;
+    unsigned vlan_onoff_reg = 0;
+	
+    vlan_entry_index = ip175d_search_vlan_entry(dev,vid);
+	
+    remove_tag_mask = untag_mask;
+    add_tag_mask = mbr_mask - untag_mask;
+    ip175d_vlan_entry_set(dev, vlan_entry_index, vid, mbr_mask, remove_tag_mask, add_tag_mask);
+
+    //set enable vlan
+    vlan_onoff_reg = IP175D_VLAN_ENTRYS_ONOFF_REG;
+    reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, vlan_onoff_reg);
+    reg_val |= (1 << vlan_entry_index);
+    mdiobus_write(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, vlan_onoff_reg, reg_val);
+
+    return RET_OK;
+}
+
+int ip175_get_vlan_port(struct net_device *dev, struct ethtool_vlan_port *port){
+    unsigned int index =0, reg_num = 0, reg_val =0 ;
+
+    if(dev == NULL || port == NULL){
+        printk(KERN_ERR "%s:dev or port is null!", __func__);
+        return -1;
+    }
+
+    printk("%s:get vid:0x%02x info!\n", __func__, port->vid);
+    for(index = 0; index < IP175D_ENTRYS_NUM; index++){
+        reg_num = IP175D_VALN_ENTRY0_START_REG + index;
+        reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, reg_num);
+        if(reg_val == port->vid){
+            DBG_INFO("cur vlan entry reg: %d vlan entry index:%d reg val:0x%02x vid:%d\n",reg_num, index, reg_val, port->vid);
+            break;
+        }
+    }
+    ip175d_vlan_entry_get(dev, index);
+
+    for(index = 0; index < IP175D_PORT_NUM; index++){
+        reg_num = IP175D_PORT_VID_REG_START + index;
+        reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, reg_num);
+        if(reg_val == port->vid){
+            printk("%s:get vid:0x%02x info port:0x%d!\n", __func__, port->vid, index);
+        }
+    }
+    return 0;
+}
+
+int ip175_add_vlan_port(struct net_device *dev, struct ethtool_vlan_port *port){
+    int ret = RET_ERROR;
+
+    if(dev == NULL || port == NULL){
+        printk(KERN_ERR "%s:dev or port is null!\n", __func__);
+        return -1;
+    }
+
+    /* vid 2 ~ 4094 */
+    if((port->vid == 0) ||port->vid >= IP175d_MAX_VID){
+        printk(KERN_ERR "%s:port VID invalid:0x%02x\n", __func__, port->vid);
+        return -2;
+    }
+
+    ret = ip175d_vlan_set(dev, port->vid, port->Mbrmsk, port->Untagmsk);
+	
+    if(ret == RET_OK){
+        printk("vlan add port succeed: vid=%d, mbr=%x, untagmask:%x\n",port->vid, port->Mbrmsk, port->Untagmsk);
+    }else{
+        printk(KERN_ERR "vlan add port failed(0x%x): vid=%d, mbr=%x, untagmask:%x\n", ret, port->vid, port->Mbrmsk, port->Untagmsk);
+    }
+    return RET_OK;
+}
+
+int ip175_remove_vlan_port(struct net_device *dev, struct ethtool_vlan_port *port){
+    unsigned int index =0, reg_num = 0, reg_val =0 ;
+
+    if(dev == NULL || port == NULL){
+        printk(KERN_ERR "%s:dev or port is null!", __func__);
+        return -1;
+    }
+
+    printk("%s:get vid:0x%02x info!\n", __func__, port->vid);
+    for(index = 0; index < IP175D_ENTRYS_NUM; index++){
+        reg_num = IP175D_VALN_ENTRY0_START_REG + index;
+        reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, reg_num);
+        if(reg_val == port->vid){
+            DBG_INFO("cur vlan entry reg: %d vlan entry index:%d reg val:0x%02x vid:%d\n",reg_num, index, reg_val, port->vid);
+            break;
+        }
+    }
+    ip175d_vlan_entry_set(dev, index, 0, 0x3f3f, 0, 0);
+
+    for(index = 0; index < IP175D_PORT_NUM; index++){
+        reg_num = IP175D_PORT_VID_REG_START + index;
+        reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, reg_num);
+        if(reg_val == port->vid){
+            mdiobus_write(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, reg_num, 1);
+        }
+    }
+
+    return 0;
+}
+
+int ip175_set_untagged_vlan_port(struct net_device *dev, struct ethtool_untagged_vlan_port * uport){
+    unsigned int port_vid_reg_num = 0;
+
+    if(dev == NULL || uport == NULL){
+        printk(KERN_ERR "%s:dev or port is null!", __func__);
+        return -1;
+    }
+
+    if (uport->port >= MAX_PORTS){
+        printk(KERN_ERR "%s:port:%d is too large!", __func__, uport->port );
+        return -2;
+    }
+
+    //set port vid, if have untagged frame received, use pvid search vlan table 
+    port_vid_reg_num = IP175D_PORT_VID_REG_START + uport->port;
+    DBG_INFO("port_vid_reg_num: %d pvid:0x%02x \n",port_vid_reg_num, uport->vid);
+    mdiobus_write(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, port_vid_reg_num, uport->vid);
+    printk("vlan set port untagged succeed: port=%d, vid=%d\n",uport->port, uport->vid);
+
+    return 0;
+}
+
+int ip175_get_untagged_vlan_port(struct net_device *dev, struct ethtool_untagged_vlan_port *uport){
+    unsigned int port_vid_reg_num = 0, port_vid_reg_val = 0;
+
+    if(dev == NULL || uport == NULL){
+        printk(KERN_ERR "%s:dev or port is null!", __func__);
+        return -1;
+    }
+
+    if (uport->port >= MAX_PORTS){
+        printk(KERN_ERR "%s:port:%d is too large!", __func__, uport->port );
+        return -2;
+    }
+
+    //set port vid, if have untagged frame received, use pvid search vlan table 
+    port_vid_reg_num = IP175D_PORT_VID_REG_START + uport->port ;
+    port_vid_reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, port_vid_reg_num);
+    printk("port %d pvid: 0x%02x\n",uport->port,port_vid_reg_val);
+
+    return 0;
+}
+
+
+static int ip175d_vlan_entry_set_pri(struct net_device *dev, unsigned int vlan_entry_index, unsigned int pri){
+    unsigned int pri_onoff_reg = 0, pri_val_reg = 0, reg_val = 0;
+
+    /* enable cur vlan entry pri */
+    pri_onoff_reg = IP175D_VLAN_ENTRYS_PRI_ONOFF_REG;
+    reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, pri_onoff_reg);
+    DBG_INFO("addr:%d pri_onoff_reg: %d ori reg_val:%02x\n", IP175D_VLAN_ADDR_22, pri_onoff_reg, reg_val);
+
+    reg_val |= (1 << vlan_entry_index);
+    DBG_INFO("addr:%d pri_onoff_reg: %d new reg_val:%02x\n", IP175D_VLAN_ADDR_22, pri_onoff_reg, reg_val);
+    mdiobus_write(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, pri_onoff_reg, reg_val);
+
+    /* set cur vlan entry pri value */
+    pri_val_reg = IP175D_VLAN_ENTRYS_PRI_VAL_START_REG + vlan_entry_index/2;
+    reg_val = pri << 5;
+    vlan_set_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, pri_val_reg, reg_val);
+
+
+    return 0;
+}
+
+static int ip175d_vlan_entry_get_pri(struct net_device *dev, unsigned int vlan_entry_index){
+    unsigned int pri_val_reg = 0;
+
+    /* get cur vlan entry pri value */
+    pri_val_reg = IP175D_VLAN_ENTRYS_PRI_VAL_START_REG + vlan_entry_index/2;
+    vlan_get_shift_val(vlan_entry_index%2, dev->phydev->mdio.bus, IP175D_VLAN_ADDR_23, pri_val_reg);
+
+    return 0;
+}
+
+int ip175_set_untagged_vlan_port_priority(struct net_device *dev, struct ethtool_untagged_port_priority *ppriority){
+
+    unsigned int vlan_entry_index = 0;
+    unsigned int reg_val = 0, bit_val = 0;
+    /* set cur vlan entry members */
+
+    if(dev == NULL || ppriority == NULL){
+        printk(KERN_ERR "%s:dev or ppriority is null!", __func__);
+        return -1;
+    }
+
+    //skip the entry 0[default vid 1], find the enable entry, set pri value in it
+    reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, IP175D_VLAN_ENTRYS_ONOFF_REG);
+    for(vlan_entry_index = 1; vlan_entry_index < IP175D_ENTRYS_NUM; vlan_entry_index++){
+        bit_val = reg_val & (1 << vlan_entry_index);
+        if(bit_val){
+            ip175d_vlan_entry_set_pri(dev, vlan_entry_index, ppriority->priority);
+            break;
+        }
+    }
+    return 0;
+}
+
+int ip175_get_untagged_vlan_port_priority(struct net_device * dev, struct ethtool_untagged_port_priority *ppriority){
+    unsigned int index =0, vlan_entry_index = 0;
+    unsigned int reg_val = 0, bit_val = 0;
+    /* set cur vlan entry members */
+
+    if(dev == NULL || ppriority == NULL){
+        printk(KERN_ERR "%s:dev or ppriority is null!", __func__);
+        return -1;
+    }
+
+    reg_val = mdiobus_read(dev->phydev->mdio.bus, IP175D_VLAN_ADDR_22, IP175D_VLAN_ENTRYS_PRI_ONOFF_REG);
+    //skip the entry 0[default vid 1], find the enable entry, set pri value in it
+    for(vlan_entry_index = 1; vlan_entry_index < IP175D_ENTRYS_NUM; vlan_entry_index++){
+        bit_val = reg_val & (1 << vlan_entry_index);
+        if(bit_val){
+            ip175d_vlan_entry_get_pri(dev, index);
+            break;
+        }
+    }
+    return 0;
+}
+
+int ip175_init_vlan(struct net_device *dev, struct ethtool_vlan_port *port){
+
     int i;
     /* VLAN classification rules: tag-based VLANs, use VID to classify, clear vlan table
     drop packets that cannot be classified.
     port 0 ~ 5 set tag-based VLANs   
-    P1 P5   pvid classification   P0 VID classification */
-    mdiobus_write(dev->phydev->mdio.bus, 22, 0, 0x0fbf);//003f
+    P1 P5   pvid classification always use PVID to search VLAN table
+    P0 VID classification use VID to search VLAN table if tag packet use PVID to search VLAN table if untag packet*/
+    mdiobus_write(dev->phydev->mdio.bus, 22, 0, 0x0fbf);//
 
     /* Ingress rules: CFI=1 dropped, null VID is untagged, VID=1 passed,
     VID=0xfff discarded, admin both tagged and untagged, ingress,admit all packet
@@ -92,723 +431,53 @@ int ip175_init_vlan(struct net_device *dev, struct ethtool_vlan_port *port)
     for(i = 0; i < 16; i++)
         mdiobus_write(dev->phydev->mdio.bus, 22, 14+i, 0x0000);
 
-    /*defalut port pvid 1*/
 
-    return RET_OK;
-}
-
-int ip175d_vlan_entry_get(unsigned int vlanIndex, unsigned int *portVid, unsigned int *portMbrmsk, unsigned int *portUntamsk, unsigned int *portfid, struct net_device *dev)
-{
-    int regVal;
-    unsigned int regNum;
-
-    if ((vlanIndex > 15) || (NULL == portVid) || (NULL == portMbrmsk) || (NULL == portUntamsk) || (NULL == portfid))
-        return RET_ERROR;
-
-    regNum = 14 + vlanIndex;
-    /* vlan info --include fid and vlan */
-    regVal = mdiobus_read(dev->phydev->mdio.bus, 22, regNum);
-    *portVid = regVal & 0xFFF;
-    *portfid = (regVal >> 12) & 0xf;
-    /* mbrmsk  and Add-tagmask ---- get vlan member and add tag info */
-    if(vlanIndex % 2 == 0)
-    {
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 23, vlanIndex/2);
-        *portMbrmsk = regVal & IP175D_MAX_PORTMASK;
-
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 23, 8 + (vlanIndex/2));
-        *portUntamsk = regVal & 0x3F;
-        DBG_INFO("VLAN_%d , vid : 0x%x  portMbrmsk : 0x%x, portUntamsk(add-tag) : 0x%x\n",vlanIndex,*portVid,*portMbrmsk,*portUntamsk);
-    }
-    else{
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 23, vlanIndex/2);
-        regVal = (regVal >> 8);
-        *portMbrmsk = regVal & IP175D_MAX_PORTMASK;
-
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 23, 8 + (vlanIndex/2));
-        regVal = (regVal >> 8);
-        *portUntamsk = regVal & 0x3F;
-        DBG_INFO("VLAN_%d , vid : 0x%x  portMbrmsk : 0x%x, portUntamsk(add-tag) : 0x%x\n",vlanIndex,*portVid,*portMbrmsk,*portUntamsk);
-    }
-
-    return RET_OK;
-}
-
-int ip175d_vlan_get(unsigned int vid, ip175d_portmask_t *mbrmsk, ip175d_portmask_t *untagmsk, unsigned int *pFid, struct net_device *dev)
-{
-    int i;
-    int hit_flag;
-    unsigned int vid_val, mbrmsk_val, untagmsk_val, fid_val;
-
-    /* vid must be 1~4094 */
-    if ((vid == 0) || (vid > (IP175d_MAX_VID -1)))
-        return RET_ERROR;
-
-    /*seach the vlan table*/
-    hit_flag = FALSE;
-    for (i = 15; i >= 0; i--)
-    {
-        ip175d_vlan_entry_get(i, &vid_val, &mbrmsk_val, &untagmsk_val, &fid_val, dev);
-        if(vid_val == vid)
-        {
-            hit_flag = TRUE;
-            mbrmsk->bits[0] = mbrmsk_val;
-            untagmsk->bits[0] = untagmsk_val;
-            *pFid = fid_val;
-            //return RET_OK;
-        }
-    }
-
-    if(!hit_flag)
-        return -1;
-
-    return RET_OK;
-}
-
-int ip175_get_vlan_port(struct net_device *dev, struct ethtool_vlan_port *port)
-{
-    ip175d_portmask_t mbrmsk, untagmsk;
-    unsigned int fid;
-    int ret, regVal, i;
-
-    /* Pvid */
-    for(i = 0; i < 6; i++)
-    {
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 22, 4+i);
-        DBG_INFO("[VLAN_INFO_%d] Port %d Pvid：%d\n",i,i,regVal);
-    }
-
-    /* get Vlan table */
-    ret = ip175d_vlan_get((unsigned int)port->vid, &mbrmsk, &untagmsk, &fid, dev);
-    if(ret == RET_OK)
-    {
-        port->Mbrmsk = mbrmsk.bits[0];
-        port->Untagmsk = untagmsk.bits[0];
-        DBG_INFO("vlan get port succeed: vid=%d Mbrmsk = %d Add-tagmsk = %d\n",
-                port->vid, port->Mbrmsk, port->Untagmsk);
-    }
-    else
-        DBG_INFO(KERN_ERR "vlan get port failed(0x%x): vid=%d\n", ret, port->vid);
-
-    return RET_OK;
-}
-
-int ip175d_vlan_entry_set(unsigned int vlanIndex, unsigned int Vid, unsigned int Mbrmsk, unsigned int Untamsk, unsigned int fid, struct net_device *dev)
-{
-    unsigned int regNum;
-    int regVal, old_regVal;
-
-    if ((vlanIndex > 15) || (Vid > IP175d_MAX_VID))
-        return -1;
-
-    /* set vlan ID, Fid */
-    regNum = 14 + vlanIndex;
-    regVal = (Vid & IP175d_MAX_VID) | ((fid & 0xf) << 12);
-    mdiobus_write(dev->phydev->mdio.bus, 22, regNum, regVal);
-
-    if(vlanIndex % 2 == 0)//[0:5]
-    {
-        /* set vlan menbership */
-        old_regVal = mdiobus_read(dev->phydev->mdio.bus, 23, vlanIndex/2);
-        old_regVal |= 0x3F;
-        regVal = (Mbrmsk | (~IP175D_MAX_PORTMASK)) & old_regVal;
-        mdiobus_write(dev->phydev->mdio.bus, 23, vlanIndex/2, regVal);
-        //DBG_INFO("Mbrmsk: 0x%x\n",regVal);
-
-        /* set vlan untag mask */
-        old_regVal = mdiobus_read(dev->phydev->mdio.bus, 23, 8+vlanIndex/2);
-        old_regVal |= 0x3F;
-        regVal = (Untamsk | (~IP175D_MAX_PORTMASK)) & old_regVal;
-        mdiobus_write(dev->phydev->mdio.bus, 23, 8+vlanIndex/2, regVal);
-        //DBG_INFO("Untamsk : 0x%x\n",regVal);
-    }
-    else{// [13:8]
-        /* set vlan menbership */
-        old_regVal = mdiobus_read(dev->phydev->mdio.bus, 23, vlanIndex/2);
-        old_regVal &= 0x3F;
-        regVal = ((Mbrmsk & IP175D_MAX_PORTMASK) << 8) | old_regVal;
-        mdiobus_write(dev->phydev->mdio.bus, 23, vlanIndex/2, regVal);
-        //DBG_INFO("Mbrmsk : 0x%x\n",regVal);
-		
-        /* set vlan untag mask */
-        old_regVal = mdiobus_read(dev->phydev->mdio.bus, 23, 8+vlanIndex/2);
-        old_regVal &= 0x3F; 
-        regVal = ((Untamsk & IP175D_MAX_PORTMASK) << 8)| old_regVal;
-        mdiobus_write(dev->phydev->mdio.bus, 23, 8+vlanIndex/2, regVal);
-        //DBG_INFO("Untamsk : 0x%x\n",regVal);
-    }
-
-    return RET_OK;
-}
-
-int ip175d_vlan_set(unsigned int vid, ip175d_portmask_t mbrmsk, ip175d_portmask_t untagmsk, unsigned int fid, struct net_device *dev)
-{
-    int i;
-    int fullflag, fill_Val, regval,fill_Val1;
-
-    /* vid 1 ~ 4094 */
-    if((vid == 0) || vid > (IP175d_MAX_VID -1)){
-        printk(KERN_ERR "port VID invalid\n");
-        return -1;
-    }
-
-    fullflag = FALSE;
-    /* cmp table vid and port vid ; vlan full ?  */
-    for(i = 0; i < 16; i++)
-    {
-        /* vlan 15~0  VLAN_VALID */
-        regval = mdiobus_read(dev->phydev->mdio.bus, 22, 10);
-        //DBG_INFO("vlan original regValue = 0x%d\n",regval);
-        fill_Val = regval & (1 << i);
-        //DBG_INFO(" Entry VLAN_%d = %d\n",i,fill_Val);
-        if(fill_Val)
-        {
-            fullflag = TRUE;
-            continue;
-        }
-        else{
-            /* add vlan */
-            ip175d_vlan_entry_set(i, vid, mbrmsk.bits[0], untagmsk.bits[0], 0, dev);
-            /*  set  Entry VLAN_VALID 1 */
-            fill_Val1 = regval | (1 << i);
-            mdiobus_write(dev->phydev->mdio.bus, 22, 10, fill_Val1);
-            fullflag = FALSE;
-            break;
-        }
-
-    }
-
-    if(fullflag == TRUE)
-    {
-        printk("vlan fulll,please remove vlan or uninit\n");
-        return RET_ERROR;
-    }
-
-    return RET_OK;
-
-}
-
-int ip175_add_vlan_port(struct net_device *dev, struct ethtool_vlan_port *port)
-{
-    ip175d_portmask_t mbrmsk, untagmsk;
-    int ret;
-    unsigned int fid = 0;
-
-    mbrmsk.bits[0] = port->Mbrmsk;
-    untagmsk.bits[0] = port->Untagmsk;
-
-    ret = ip175d_vlan_set((unsigned int)port->vid, mbrmsk, untagmsk, fid, dev);
-    if(ret == RET_OK)
-    {
-        DBG_INFO("vlan add port succeed: vid=%d, mbr=%x, Add_tag=%x\n\n",
-            port->vid, mbrmsk.bits[0], untagmsk.bits[0]);
-    }
-    else{
-        DBG_INFO(KERN_ERR "vlan add port failed(0x%x): vid=%d, mbr=%x, Add_tag=%x\n\n",
-                ret, port->vid, mbrmsk.bits[0], mbrmsk.bits[0]);		
-    }
-
-    return RET_OK;
-}
-
-int ip175_remove_vlan_port(struct net_device *dev, struct ethtool_vlan_port *port)
-{
-    int i, regVal;
-    ip175d_portmask_t mbrmsk, untagmsk;
-    unsigned int vid_val, mbrmsk_val, untagmsk_val, fid_val;
-    unsigned int fid = 0;
-
-    mbrmsk.bits[0] = 0;
-    untagmsk.bits[0] = 0;
-	
-    /* get vid, mbrmsk, untagmask, fid  & clear vlan */
-    for (i = 15; i >= 0; i--)
-    {
-        ip175d_vlan_entry_get(i, &vid_val, &mbrmsk_val, &untagmsk_val, &fid_val, dev);
-        if(vid_val == port->vid)
-        {
-            mbrmsk_val = 0x3f;
-            untagmsk_val = untagmsk.bits[0];
-            /*set vlan id=0, mbr=0x3f, untagmsk=0, fid=0*/
-            ip175d_vlan_entry_set(i, 0, mbrmsk_val, untagmsk_val, fid, dev);
-            regVal = mdiobus_read(dev->phydev->mdio.bus, 22, 10);
-            regVal = regVal & (~(1 << i));
-            mdiobus_write(dev->phydev->mdio.bus, 22, 10, regVal);//set 0
-            return RET_OK;
-        }
-    }
-
-    return RET_OK;   
-}
-
-int ip175d_remove_tag_set(unsigned int vlanIndex, unsigned int port, struct net_device *dev, unsigned int Flag)
-{
-    int old_Val, regVal;
-
-	/* Different Vid  Set Remove-tag */
-    if(DIFFERENT_PORT_TAG_FLAG == Flag)
-    {
-        if(vlanIndex % 2 == 0)//low bit [0:5]
-        {
-            /* get old reg-Val */
-            old_Val = mdiobus_read(dev->phydev->mdio.bus, 23, 16+vlanIndex/2);
-            //DBG_INFO("[ %d ]  Old remove-tag Reg_Val ：0x%x\n",__LINE__,old_Val);
-            old_Val |= 0x3F;
-            regVal = ((1 << port) | (~IP175D_MAX_PORTMASK)) & old_Val; 
-            //DBG_INFO("[ %d ]  new remove-tag Reg_Val ：0x%x\n",__LINE__,regVal);
-            // set remove tag
-            mdiobus_write(dev->phydev->mdio.bus, 23, 16+vlanIndex/2, regVal);
-        }
-        else{//hight bit[13:8]
-
-            /* get old reg-Val */
-            old_Val = mdiobus_read(dev->phydev->mdio.bus, 23, 16+vlanIndex/2);
-            old_Val &= 0x3F;
-            regVal = (((1 << port) & IP175D_MAX_PORTMASK) << 8) | old_Val; 
-            //DBG_INFO("[ %d ] new remove-tag Reg_Val ：0x%x\n",__LINE__,regVal);
-            /* set remove tag */
-            mdiobus_write(dev->phydev->mdio.bus, 23, 16+vlanIndex/2, regVal);
-        }
-    }
-	/* One Port Enabled Set Remove-tag is 0*/
-    if(LAN_PORT_TAG_FLAG == Flag)
-    {
-        if(vlanIndex % 2 == 0){/* [0:5] set 0 */
-            /* get old reg-Val */
-            old_Val = mdiobus_read(dev->phydev->mdio.bus, 23, 16+vlanIndex/2);
-            //DBG_INFO("[ %d ]  Old remove-tag Reg_Val ：0x%x\n",__LINE__,old_Val);
-            old_Val |= 0x3F;
-            regVal = old_Val & 0xFF00;//0
-            //DBG_INFO("[ %d ] new remove-tag Reg_Val ：0x%x\n",__LINE__,regVal);
-            /* set remove tag */
-            mdiobus_write(dev->phydev->mdio.bus, 23, 16+vlanIndex/2, regVal);
-        }
-        else{	/* [13:8]  set 0 */
-            /* get old reg-Val */
-            old_Val = mdiobus_read(dev->phydev->mdio.bus, 23, 16+vlanIndex/2);
-            //DBG_INFO("[ %d ]  Old remove-tag Reg_Val ：0x%x\n",__LINE__,old_Val);
-            old_Val &= 0x3F3F;
-            regVal = old_Val & 0x00FF; //0
-            //DBG_INFO("[ %d ] new remove-tag Reg_Val ：0x%x\n",__LINE__,regVal);
-            /* set remove tag */
-            mdiobus_write(dev->phydev->mdio.bus, 23, 16+vlanIndex/2, regVal);
-        }
-    }
-    /* LAN Port & WAN Port Enabled Set Remove-tag ; fixed VLAN0  */
-    if(DOUBLE_EQUAL_PORT_TAG_FLAG == Flag){
-        /* get old reg-Val */
-        old_Val = mdiobus_read(dev->phydev->mdio.bus, 23, 16+vlanIndex/2);
-        regVal = (1 << port) | old_Val;
-        /* set remove tag */
-        mdiobus_write(dev->phydev->mdio.bus, 23, 16+vlanIndex/2, regVal);
-    }
-
-    return RET_OK;
-}
-
-int ip175d_vlan_port_remove_tag(unsigned int port, unsigned int vid, struct net_device *dev)
-{
-    unsigned int vid_val, mbrmsk_val, untagmsk_val, fid_val, Pmbrmsk;
-    int i ,regVal, Disable_flag, fill_Val, Enable_bit, Enable_Val;
-    for(i = 0; i < 16; i++)
-    {
-        ip175d_vlan_entry_get(i, &vid_val, &mbrmsk_val, &untagmsk_val, &fid_val, dev);
-        Pmbrmsk = mbrmsk_val & 0x23;/*  Port0, Port1, Port5	*/
-		/* Wan & Lan Port Enabled; Different Vid  Set Remove-tag */
-        if(vid_val == vid && untagmsk_val != 0 && Pmbrmsk != 0x23)
-        {
-            ip175d_remove_tag_set(i, port, dev, DIFFERENT_PORT_TAG_FLAG);
-            break;
-        }
-		/* Wan & Lan Port Enabled; The same Vid  Set Remove-tag */
-        if(vid_val == vid && untagmsk_val != 0 && Pmbrmsk == 0x23){
-            ip175d_remove_tag_set(i, port, dev, DOUBLE_EQUAL_PORT_TAG_FLAG);
-            break;
-        }
-		/*  WAN Port Enabled ;  Set Remove-tag ; Port1: untagpackt     */
-        if(vid_val == vid  && untagmsk_val == 0 && port == PHY_LAN_PORT)
-        {
-            //DBG_INFO("WAN Port Enabled-->> vid:0x%x, mbrmsk_val: 0x%x, add-tag: 0x%x , port: %d \n",vid_val,mbrmsk_val,untagmsk_val,port);
-            ip175d_remove_tag_set(i, port, dev, LAN_PORT_TAG_FLAG);
-            break;
-        }
-		/* LAN Port Enabled ;  Set Remove-tag ; Fixed Entry_5 & VLAN_5 ; Port5: untagpackt   */
-        if(vid_val == vid && untagmsk_val == 0 && port == PHY_CPU_PORT)
-        {
-            /*1. Set Entry_i Disenable*/
-            Disable_flag = (1 << i);
-            regVal = mdiobus_read(dev->phydev->mdio.bus, 22, 10);
-            fill_Val = regVal & (~Disable_flag);
-            mdiobus_write(dev->phydev->mdio.bus, 22, 10, fill_Val);
-            /*2. clear vlan vid=0, membermask=0x3f/0, untagmask, remove-tag*/
-            ip175d_vlan_entry_set(i, 0, 0x3f, 0, 0, dev);
-
-            /*3. Set Entry_5 enable  fixed VLAN5 */
-            Enable_bit = 1 << port;
-            regVal = mdiobus_read(dev->phydev->mdio.bus, 22, 10);
-            Enable_Val = regVal | Enable_bit;
-            mdiobus_write(dev->phydev->mdio.bus, 22, 10, Enable_Val);
-            /*4. Set VLAN_5 vid, membermask, add-tagmask*/
-            ip175d_vlan_entry_set(port, vid_val, mbrmsk_val, untagmsk_val, fid_val, dev);
-            /*5. Set remove-tag*/
-            ip175d_remove_tag_set(i, port, dev, LAN_PORT_TAG_FLAG);
-            break;
-        }
-    }
-    return RET_OK;
-}
-
-#if 0
-int ip175d_remove_tag_get(unsigned int vlanIndex, unsigned int port, struct net_device *dev)
-{
-    int regVal;
-    //unsigned int regNum;
-
-    if(vlanIndex % 2 == 0)//low bit [0:5]
-    {
-        // get old reg-Val
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 23, 16+vlanIndex/2);
-        DBG_INFO("VLAN_%d Remove-tag：0x%x\n",vlanIndex,regVal);
-    }
-    else{//hight bit[13:8]
-	
-        // get old reg-Val
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 23, 16+vlanIndex/2);
-        DBG_INFO("VLAN_%d Remove-tag：0x%x\n",vlanIndex,regVal);
-    }
-    return RET_OK;
-}
-#endif
-
-int ip175d_vlan_port_remove_tag_get(unsigned int port, unsigned int vid, struct net_device *dev)
-{
-//    unsigned int vid_val, mbrmsk_val, untagmsk_val, fid_val;
-    int i;
-    int regVal;
-	
-    for(i = 0; i < 8; i++)
-    {
-    /*
-        ip175d_vlan_entry_get(i, &vid_val, &mbrmsk_val, &untagmsk_val, &fid_val, dev);
-        if(vid_val == vid)
-        {
-            //根据端口移位设置remove tag
-            ip175d_remove_tag_get(i, port, dev);
-            break;
-        }
-    */
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 23, 16+i);
-        DBG_INFO("VLAN_%d Remove-tag：0x%x\n",i,regVal);
-    }
-    return RET_OK;
-
-}
-
-int ip175d_vlan_portPvid_set(unsigned int port, unsigned int vid, struct net_device *dev)
-{
-    unsigned int vid_val, mbrmsk_val, untagmsk_val, fid, pvid, Pmbrmsk;
-    int i, fill_Val, regval;
-    unsigned int regNum;
-
-    if (port > 5)
-        return RET_ERROR;
-
-    regNum = 4 + port;
-
-    /*pvid_0 ~ pvid_5 <==> vid_0 ~ vid_5
-    search vlan table ;  get vid & set pvid */
-    for(i = 0; i < 6; i++)
-    {
-        //vlan 15~0 vlan_valid 	
-        regval = mdiobus_read(dev->phydev->mdio.bus, 22, 10);
-        fill_Val = regval & (1 << i);
-        if(fill_Val)
-        { 
-            ip175d_vlan_entry_get(i, &vid_val, &mbrmsk_val, &untagmsk_val, &fid, dev);
-            Pmbrmsk =  (mbrmsk_val >> port) & 0x1;
-            /* Set pvid = vid  */
-            if(vid_val == vid && Pmbrmsk)
-            {
-                pvid = vid_val;
-                mdiobus_write(dev->phydev->mdio.bus, 22, regNum, pvid);//pvid
-            }
-            continue;
-        }
-    }
-	
-    return RET_OK;
-}
-
-int ip175_set_untagged_vlan_port(struct net_device *dev, struct ethtool_untagged_vlan_port * uport)
-{
-    int ret;
-
-    /* Set pvid = vid */
-    ip175d_vlan_portPvid_set((unsigned int) uport->port, uport->vid, dev);
-
-    /* Set remove tag  by Port num*/
-    ret =  ip175d_vlan_port_remove_tag((unsigned int) uport->port, uport->vid, dev);
-    if (ret != RET_OK) {
-        DBG_INFO(KERN_ERR "vlan set port untagged failed(0x%x): port=%d\n\n",
-            ret, uport->port);
-    }	
-
-    return ret;
-}
-
-int ip175_get_untagged_vlan_port(struct net_device *dev, struct ethtool_untagged_vlan_port *uport)
-{
-    int ret;
-    unsigned int regNum;
-    int regVal;
-
-    /* get pvid  port 0 ~ port 5 */
-    if (uport->port > MAX_PORTS-1)
-        return RET_ERROR;
-    regNum = 4 + uport->port;
-    regVal = mdiobus_read(dev->phydev->mdio.bus, 22, regNum);
-    DBG_INFO("Port %d pVid: 0x%x\n",uport->port,regVal);
-
-    /* get remove-tag */
-    ret = ip175d_vlan_port_remove_tag_get((unsigned int) uport->port, uport->vid, dev);
-    if(ret != RET_OK) {
-        DBG_INFO(KERN_ERR "vlan get port untagged failed(0x%x): port=%d, vid=%d \n",
-            ret, uport->port,uport->vid);
-    }
-
-    return ret;
-
-}
-
-int ip175d_rew_vlan_pri_set(unsigned int vlanIndex, unsigned int port, unsigned int priority, struct net_device *dev)
-{
-    unsigned int old_Val, regVal;
-
-    if(vlanIndex % 2 == 0)//low bit [7:5]
-    {
-        // get old reg-Val
-        old_Val = mdiobus_read(dev->phydev->mdio.bus, 23, 24+vlanIndex/2);
-        old_Val &= (~0xe0);//000x xxxx
-        regVal = (priority << 5) | old_Val; //xxx << 5
-        // set priority
-        mdiobus_write(dev->phydev->mdio.bus, 23, 24+vlanIndex/2, regVal);
-    }
-    else{// [15:13]
-        // get old reg-Val
-        old_Val = mdiobus_read(dev->phydev->mdio.bus, 23, 24+vlanIndex/2);
-        old_Val &= (~0xe000);//000x xxxx xxxx xxxx
-        regVal = (priority << 13) | old_Val;
-        // set remove tag
-        mdiobus_write(dev->phydev->mdio.bus, 23, 24+vlanIndex/2, regVal);
-    }
-
-    return RET_OK;
-}
-
-int ip175d_rew_vlan_pri(unsigned int port, unsigned int priority, struct net_device *dev)
-{
-    unsigned int regVal, regBit, regNum, prioVal;
-    unsigned int vid_val, mbrmsk_val, untagmsk_val, fid_val, Pmbrmsk, pvid;
-    int i;
-	
-    /* port pvid */
-    regNum = 4+port;
-    pvid = mdiobus_read(dev->phydev->mdio.bus, 22, regNum);
-    //DBG_INFO("Port PVID:%d\n",pvid);
-	
-    for(i = 0; i < 16; i++)
-    {
-        /* ensure VLAN_VALID value  */
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 22, 10);
-        //DBG_INFO("VLAN_VALID ：0x%x\n",regVal);
-        regBit = (regVal >> i) & 0x1;
-        //DBG_INFO("VLAN_%d, VALID ：0x%x\n",i,regBit);
-        if(regBit)
-        {
-            /* search vlan  valid vlan */
-            ip175d_vlan_entry_get(i, &vid_val, &mbrmsk_val, &untagmsk_val, &fid_val, dev);
-            Pmbrmsk = mbrmsk_val & 0x23;//Port0, Port1, Port5
-            /*  vid_val == pvid ; That means the other VLANs are zero */
-            if(vid_val == pvid)
-            {
-                //DBG_INFO("Enable Wan & Lan Port , Different ID\n");
-            /*  Entry i of re-write vlan priority field is enable 	  */
-                prioVal = mdiobus_read(dev->phydev->mdio.bus, 22, 13);
-                prioVal = (1 << i) | prioVal;
-                //DBG_INFO("Enable VLAN_%d Priority: 0x%x\n",i,prioVal);
-                mdiobus_write(dev->phydev->mdio.bus, 22, 13, 0x0003);
-                /* set priority */
-                ip175d_rew_vlan_pri_set(i, port, priority, dev);
-                break;
-            }
-        }	
-    }
-
-    return RET_OK;
-}
-
-int ip175_set_untagged_vlan_port_priority(struct net_device *dev, struct ethtool_untagged_port_priority *ppriority)
-{
-    int ret;
-	
-    if(ppriority->port > (MAX_PORTS -1))
-        return RET_ERROR;
-    if(ppriority->priority > 7)
-        return RET_ERROR;
-
-    ret = ip175d_rew_vlan_pri(ppriority->port, ppriority->priority, dev);
-    if(ret == RET_OK)
-        DBG_INFO(" vlan priority set succeed:  port=%d, priority=0x%x \n ",ppriority->port,ppriority->priority);
-
-    return RET_OK;	
-}
-
-int ip175_get_untagged_vlan_port_priority(struct net_device * dev, struct ethtool_untagged_port_priority *ppriority)
-{
-    int i;
-    unsigned int Priority;
-
-    if (ppriority->port > MAX_PORTS-1)
-        return RET_ERROR;
-
-    for(i = 0; i < 8; i++)
-    {
-        Priority = mdiobus_read(dev->phydev->mdio.bus, 23, 24+i);
-        DBG_INFO("[7:5] vlan get port untagged priority succeed: 0x%x\n",Priority);
-    }
-
-    return RET_OK;
-}
-
-#if 0
-int dscp_write_regval(unsigned int dscp, unsigned int priority, struct net_device *dev, unsigned int regNum)
-{
-    unsigned int old_regVal, dscpNum, dscpBit, tmp, rew_priority;
-
-    old_regVal = mdiobus_read(dev->phydev->mdio.bus, 25, 3+regNum);
-    dscpNum = (dscp % 8);
-    dscpBit = 2*dscpNum;
-    old_regVal = (~(0x3 << dscpBit)) & old_regVal;
-    tmp = priority << dscpBit;
-    rew_priority = tmp | old_regVal;
-    mdiobus_write(dev->phydev->mdio.bus, 25, 3+regNum, rew_priority);
-
-    return RET_OK;
-}
-
-int ip175d_qos_dscpPri_set(unsigned int dscp, unsigned int priority, struct net_device *dev)
-{
-    if(dscp < 0 || priority >= 4)
-        return RET_ERROR;
-
-    if(dscp <= 0x7){
-        dscp_write_regval(dscp, priority, dev, 0);
-    }
-    else if(dscp >= 0x8 && dscp <= 0xF){
-        dscp_write_regval(dscp, priority, dev, 1);
-    }
-    else if(dscp >= 0x10 && dscp <= 0x17){
-        dscp_write_regval(dscp, priority, dev, 2);
-    }
-    else if(dscp >= 0x18 && dscp <= 0x1F){
-        dscp_write_regval(dscp, priority, dev, 3);
-    }
-    else if(dscp >= 0x20 && dscp <= 0x27){
-        dscp_write_regval(dscp, priority, dev, 4);
-    }
-    else if(dscp >= 0x28 && dscp <= 0x2F){
-        dscp_write_regval(dscp, priority, dev, 5);
-    }
-    else if(dscp >= 0x30 && dscp <= 0x37){
-        dscp_write_regval(dscp, priority, dev, 6);
-    }
-    else if(dscp >= 0x38 && dscp <= 0x3F){
-        dscp_write_regval(dscp, priority, dev, 7);
-    }
-    else{
-        DBG_INFO("Dscp Out Of Range!\n");
-        return RET_ERROR;
-    }
-
-    return RET_OK;
-}
-
-int ip175_set_dscp_priority(struct net_device *dev, struct ethtool_dscp_priority *priority)
-{
-    int ret;
-    if(priority->prior >= 4){
-        DBG_INFO(KERN_ERR "Invalid Priority\n");
-        return RET_OK;
-    }
-    if(priority->dscp > 0x3F ){
-        DBG_INFO(KERN_ERR "Invalid Dscp\n");
-        return RET_OK;
-    }
-
-    ret = ip175d_qos_dscpPri_set((unsigned int) priority->dscp, (unsigned int) priority->prior, dev);
-    if(ret != RET_OK) {
-        DBG_INFO(KERN_ERR "qos dscp priority set failed(0x%x): dscp=%d, prior=%d\n",
-            ret, priority->dscp, priority->prior);
-    }
-    else {
-        DBG_INFO("qos dscp priority set succeed: dscp=%d, prior=%d\n",
-            priority->dscp, priority->prior);
-    }
-
-    return ret;
-}
-
-
-int ip175_get_dscp_priority(struct net_device *dev, struct ethtool_dscp_priority *priority)
-{
-    int i;
-    unsigned int regVal;
-
-    for(i = 0; i < 8; i++)
-    {
-        regVal = mdiobus_read(dev->phydev->mdio.bus, 25, 3+i);
-        DBG_INFO("DSCP priority Map : 0x%x\n",regVal);
-    }
-
-    return RET_OK;
-}
-#endif
-
-int ip175_uninit_vlan(struct net_device *dev, struct ethtool_vlan_port *port)
-{
-    unsigned int vid_val, mbrmsk_val, untagmsk_val, fid_val;
-    int i, j;
-	
-    port->Mbrmsk = 0x3f;
-    port->Untagmsk = 0;
-    /* VLAN Classification Default */
-    mdiobus_write(dev->phydev->mdio.bus, 22, 0, 0x0000);
-    /* PVID Default */
-    for(i = 0; i < 6; i++)
-        mdiobus_write(dev->phydev->mdio.bus, 22, 4+i, 0x0001);
-    /* VLAN_VALID set 0 Default */
-    mdiobus_write(dev->phydev->mdio.bus, 22, 10, 0x0000);
-    /* VLAN_PRI ( REW_VLAN_PRI_EN ) set 0 Default */
-    mdiobus_write(dev->phydev->mdio.bus, 22, 13, 0x0000);
-    for(i = 0; i < 8; i++)
-    {	
-        //mdiobus_write(dev->phydev->mdio.bus, 23, i, 0x3f3f);//VLAN Member Default
-        //mdiobus_write(dev->phydev->mdio.bus, 23, 8+i, 0x0000);//VLAN Add Tag Default
+    /* clear vlan entry; vid = 0  */
+    for(i = 0; i < 8; i++) {
+        mdiobus_write(dev->phydev->mdio.bus, 23, i, 0x3f3f);//VLAN Member Default
+        mdiobus_write(dev->phydev->mdio.bus, 23, 8+i, 0x0000);//VLAN Add Tag Default
         mdiobus_write(dev->phydev->mdio.bus, 23, 16+i, 0x0000);//VLAN Remove Tag  Default
         mdiobus_write(dev->phydev->mdio.bus, 23, 24+i, 0x0000);//VLAN Miscellaneous Register Default (VLAN PRIORITY)
     }
-    for(j = 0; j < 16; j++)
-    {
-        ip175d_vlan_entry_get(j, &vid_val, &mbrmsk_val, &untagmsk_val, &fid_val, dev);
-        if(mbrmsk_val !=0)
-        {
-            //VLAN ID Default /VLAN Member Default / VLAN Add Tag Default
-            ip175d_vlan_entry_set(j, 0, port->Mbrmsk, port->Untagmsk, 0, dev);
-            continue;
-        }
+
+    /*defalut port pvid 1, set entry0 for default pvid vlan table*/
+    //enatble entry0
+    mdiobus_write(dev->phydev->mdio.bus, 22, 10, 0x0001);
+    //set entry0 default vid 1
+    mdiobus_write(dev->phydev->mdio.bus, 22, 14, 0x0001);
+    //enatble entry0 member wan+cpu+lan
+    mdiobus_write(dev->phydev->mdio.bus, 23, 0, 0x0023);
+
+#ifdef IP175D_VLAN_PROC_DEBUG
+    g_net_dev = dev;
+#endif
+    return 0;
+}
+
+int ip175_uninit_vlan(struct net_device *dev, struct ethtool_vlan_port *port){
+    int i = 0;
+
+    /* VLAN Classification Default */
+    mdiobus_write(dev->phydev->mdio.bus, 22, 0, 0x0000);
+
+    /* PVID Default */
+    for(i = 0; i < 6; i++)
+        mdiobus_write(dev->phydev->mdio.bus, 22, 4+i, 0x0001);
+
+    /* VLAN_VALID set 0 Default */
+    mdiobus_write(dev->phydev->mdio.bus, 22, 10, 0x0000);
+
+    /* VLAN_PRI ( REW_VLAN_PRI_EN ) set 0 Default */
+    mdiobus_write(dev->phydev->mdio.bus, 22, 13, 0x0000);
+
+    for(i = 0; i < 8; i++) {
+        mdiobus_write(dev->phydev->mdio.bus, 23, i, 0x3f3f);//VLAN Member Default
+        mdiobus_write(dev->phydev->mdio.bus, 23, 8+i, 0x0000);//VLAN Add Tag Default
+        mdiobus_write(dev->phydev->mdio.bus, 23, 16+i, 0x0000);//VLAN Remove Tag  Default
+        mdiobus_write(dev->phydev->mdio.bus, 23, 24+i, 0x0000);//VLAN Miscellaneous Register Default (VLAN PRIORITY)
     }
 
-    return RET_OK;
+    return 0;
 }
 
 static int _speed_proc_show(struct seq_file *seq, void *v, rtk_port_speed_t speed)
@@ -953,6 +622,77 @@ static const struct file_operations wan_duplex_fops = {
     .read       = seq_read,
     .release    = single_release,
 };
+
+#ifdef IP175D_VLAN_PROC_DEBUG
+static int vlan_reg_proc_show(struct seq_file *seq, void *v){
+    seq_printf(seq, "please read and write this file by fopen!!\n");
+    return 0;
+}
+
+static int vlan_reg_proc_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, vlan_reg_proc_show, NULL);
+}
+
+static int vlan_reg_proc_read(struct file *file, char __user *buffer,size_t count, loff_t *ppos){
+    char buf[1024];
+    int index = 0;
+    int len, num,reg_addr,reg_addr_index, reg_val;
+
+    if(copy_from_user(buf, buffer, count))
+        return -EFAULT;
+
+    num = sscanf(buf,"%d %d",&reg_addr,&reg_addr_index);
+    if(num != 2)
+        return -EFAULT;
+    if(!g_net_dev){
+        printk("==%s=g_net_dev is null! please run [ethtool --init-vlan eth0] first==\n", __func__);
+        return 0;
+    }
+    if(reg_addr == 1){
+        for(index=0;index<32;index++){
+            mdiobus_read(g_net_dev->phydev->mdio.bus, 22, index);
+        }
+        for(index=0;index<32;index++){
+            mdiobus_read(g_net_dev->phydev->mdio.bus, 23, index);
+        }
+    }else{
+        reg_val = mdiobus_read(g_net_dev->phydev->mdio.bus, reg_addr, reg_addr_index);
+    }
+
+    len += sprintf(buf,"reg_val = 0x%02x\n",reg_val);
+    
+    if(copy_to_user(buffer,buf,len))
+        return -EFAULT;
+    *ppos = len;
+    return len;
+}
+
+static int vlan_reg_proc_write(struct file *file, const char __user *buffer, size_t count, loff_t *pos){
+    int num,reg_addr,reg_addr_index, reg_val;
+    char buf[1024];
+    if(*pos > 0 || count > 1024)
+        return -EFAULT;
+    if(copy_from_user(buf, buffer, count))
+        return -EFAULT;
+    num = sscanf(buf,"%d %d %04x",&reg_addr,&reg_addr_index, &reg_val);
+    if(num != 3)
+        return -EFAULT;
+    if(!g_net_dev){
+        printk("==%s=g_net_dev is null! please run [ethtool --init-vlan eth0] first==\n", __func__);
+        return 0;
+    }
+    mdiobus_write(g_net_dev->phydev->mdio.bus, reg_addr, reg_addr_index, reg_val);
+    return 0;
+}
+
+static const struct file_operations vlan_reg_fops = {
+    .open       = vlan_reg_proc_open,
+    .read       = vlan_reg_proc_read,
+    .write  =  vlan_reg_proc_write,
+    .release    = single_release,
+};
+#endif
 
 static int ip175d_config_init(struct phy_device *phydev)
 {
@@ -1122,6 +862,10 @@ static int __init ip175d_init(void)
     proc_create("status", 0664, g_switch_wan_dir, &wan_status_fops);
     proc_create("duplex", 0664, g_switch_wan_dir, &wan_duplex_fops);
 
+#ifdef IP175D_VLAN_PROC_DEBUG
+    g_switch_vlan_dir = proc_mkdir("vlan", g_switch_dir);
+    proc_create("reg", 0664, g_switch_vlan_dir, &vlan_reg_fops);
+#endif
     ret = phy_driver_register(&ip175d_driver,THIS_MODULE);
 
     return ret;
